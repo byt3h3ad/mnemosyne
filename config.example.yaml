@@ -1,0 +1,5 @@
+raindrop_token: ""
+wayback_access_key: ""
+wayback_secret_key: ""
+db_path: "./archive.db"
+rate_limit_ms: 2000

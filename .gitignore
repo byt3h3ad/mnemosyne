@@ -1,0 +1,17 @@
+# binary
+archiver.exe
+archiver
+
+# database
+*.db
+
+# config (contains secrets)
+config.yaml
+
+# Go build cache
+/vendor/
+
+# IDE
+.vscode/
+.idea/
+*.swp
