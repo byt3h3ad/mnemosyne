@@ -1,4 +1,4 @@
-module github.com/byt3h3ad/raindrop-archiver
+module github.com/byt3h3ad/mnemosyne
 
 go 1.26.3
 

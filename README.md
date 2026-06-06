@@ -1,4 +1,4 @@
-# raindrop-archiver
+# mnemosyne
 
 Archives your [Raindrop.io](https://raindrop.io) bookmarks to the [Wayback Machine](https://web.archive.org) and writes the archive URL back as a note on each bookmark.
 
@@ -77,20 +77,20 @@ rate_limit_ms: 2000        # delay between API submissions (ms)
 ## Build
 
 ```bash
-go build -o archiver.exe ./cmd/archiver/
+go build -o mnemo.exe ./cmd/mnemosyne/
 ```
 
 ## Usage
 
 ```bash
 # Full run (fetch + archive + sync back)
-./archiver.exe
+./mnemo.exe
 
 # Sync archive URLs to Raindrop notes only (skips archiving)
-./archiver.exe -sync-only
+./mnemo.exe -sync-only
 
 # Custom config path
-./archiver.exe -config /path/to/config.yaml
+./mnemo.exe -config /path/to/config.yaml
 ```
 
 ### Example output
@@ -110,4 +110,4 @@ Run weekly as a cron job (Linux/macOS):
 0 9 * * 1 /path/to/archiver >> /var/log/archiver.log 2>&1
 ```
 
-On Windows, use Task Scheduler to run `archiver.exe` on a weekly trigger.
+On Windows, use Task Scheduler to run `mnemo.exe` on a weekly trigger.
