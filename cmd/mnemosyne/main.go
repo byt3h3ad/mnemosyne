@@ -18,6 +18,7 @@ import (
 func main() {
 	configPath := flag.String("config", "./config.yaml", "path to config.yaml")
 	syncOnly := flag.Bool("sync-only", false, "write archive URLs to Raindrop notes without re-archiving")
+	retryFailed := flag.Bool("retry-failed", false, "also retry previously failed (transient) bookmarks")
 	flag.Parse()
 
 	log.SetFlags(log.Ltime)
@@ -61,7 +62,7 @@ func main() {
 		return
 	}
 
-	summary, err := a.Run()
+	summary, err := a.Run(*retryFailed)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "run failed:", err)
 		os.Exit(1)

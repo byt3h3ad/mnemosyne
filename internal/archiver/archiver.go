@@ -45,7 +45,7 @@ func (a *Archiver) SyncBack() (int, error) {
 	return a.doSyncBack()
 }
 
-func (a *Archiver) Run() (Summary, error) {
+func (a *Archiver) Run(retryFailed bool) (Summary, error) {
 	// Record start time before any work so bookmarks created during the run
 	// are captured by the next incremental run.
 	runStart := time.Now().UTC()
@@ -69,9 +69,11 @@ func (a *Archiver) Run() (Summary, error) {
 		}
 	}
 
-	// Reset any transient failures from the previous run so they're retried.
-	if err := a.db.ResetTransient(); err != nil {
-		return Summary{}, fmt.Errorf("reset transient: %w", err)
+	// Only reset transient failures when explicitly requested.
+	if retryFailed {
+		if err := a.db.ResetTransient(); err != nil {
+			return Summary{}, fmt.Errorf("reset transient: %w", err)
+		}
 	}
 
 	// --- 2. Fetch bookmarks ---

@@ -12,27 +12,27 @@ Raindrop.io ──fetch──► archiver ──submit──► Wayback Machine
                            └──append note──► Raindrop.io
 ```
 
-On the **first run** every existing bookmark is archived. On **subsequent runs** only bookmarks created since the last run are processed. State is persisted in a local SQLite database so runs are resumable and idempotent.
+On the **first run** every existing bookmark is archived. On **subsequent runs** only bookmarks created since the last run are processed — previously failed bookmarks are skipped unless `--retry-failed` is passed. State is persisted in a local SQLite database so runs are resumable and idempotent.
 
 ## High-level design
 
 ```
 cmd/
-  archiver/main.go        entry point — parses flags, wires dependencies, runs the pipeline
+  mnemosyne/main.go       entry point — parses flags, wires dependencies, runs the pipeline
 
 internal/
   config/                 loads and validates config.yaml; applies defaults
   db/                     SQLite schema, migrations, and all query helpers
                           tables: archived_bookmarks, run_state
   raindrop/               Raindrop REST API client
-                          FetchAll / FetchSince — paginated bookmark retrieval
-                          AppendNote            — GET existing note, append archive URL, PUT back
+                          FetchAll / FetchSince — paginated bookmark retrieval (rate-limited)
+                          AppendNote            — GET existing note, append archive URL, PUT back (idempotent)
   wayback/                Wayback Machine SPN2 API client
                           Archive — submit URL, poll until success/error/timeout
-                          typed errors: PermanentError (skip forever) / TransientError (retry next run)
+                          typed errors: PermanentError (skip forever) / TransientError (retry with --retry-failed)
   archiver/               orchestration — runs the four pipeline stages in order
-                          Run      — full pipeline: fetch → archive → sync back → save state
-                          SyncBack — sync-only mode: write archive URLs to notes, skip archiving
+                          Run(retryFailed) — full pipeline: fetch → archive → sync back → save state
+                          SyncBack         — sync-only mode: write archive URLs to notes, skip archiving
 ```
 
 ### Pipeline stages
@@ -46,11 +46,11 @@ internal/
 
 ### Retry behaviour
 
-| Status | Next run |
-|---|---|
-| `failed_transient` | Reset to `pending` and retried |
-| `failed_permanent` | Skipped forever |
-| `archived`, `synced_back=0` | Sync-back retried |
+| Status | Default run | `--retry-failed` run |
+|---|---|---|
+| `failed_transient` | Skipped | Reset to `pending` and retried |
+| `failed_permanent` | Skipped forever | Skipped forever |
+| `archived`, `synced_back=0` | Sync-back retried | Sync-back retried |
 
 ## Prerequisites
 
@@ -83,14 +83,17 @@ go build -o mnemo.exe ./cmd/mnemosyne/
 ## Usage
 
 ```bash
-# Full run (fetch + archive + sync back)
+# Full run — archives new bookmarks only
 ./mnemo.exe
 
+# Also retry previously failed (transient) bookmarks
+./mnemo.exe --retry-failed
+
 # Sync archive URLs to Raindrop notes only (skips archiving)
-./mnemo.exe -sync-only
+./mnemo.exe --sync-only
 
 # Custom config path
-./mnemo.exe -config /path/to/config.yaml
+./mnemo.exe --config /path/to/config.yaml
 ```
 
 ### Example output
