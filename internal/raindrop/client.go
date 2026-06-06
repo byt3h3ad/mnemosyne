@@ -5,23 +5,26 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
 const (
-	baseURL  = "https://api.raindrop.io/rest/v1"
-	perPage  = 50
+	baseURL = "https://api.raindrop.io/rest/v1"
+	perPage = 50
 )
 
 type Client struct {
-	token      string
-	httpClient *http.Client
+	token       string
+	httpClient  *http.Client
+	rateLimitMs int
 }
 
-func NewClient(token string) *Client {
+func NewClient(token string, rateLimitMs int) *Client {
 	return &Client{
-		token:      token,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		token:       token,
+		httpClient:  &http.Client{Timeout: 30 * time.Second},
+		rateLimitMs: rateLimitMs,
 	}
 }
 
@@ -58,14 +61,22 @@ func (c *Client) FetchSince(since time.Time) ([]Bookmark, error) {
 func (c *Client) paginate(since time.Time) ([]Bookmark, error) {
 	var all []Bookmark
 	for page := 0; ; page++ {
+		if page > 0 {
+			time.Sleep(time.Duration(c.rateLimitMs) * time.Millisecond)
+		}
+
 		url := fmt.Sprintf("%s/raindrops/0?sort=-created&page=%d&perpage=%d", baseURL, page, perPage)
 		var resp listResponse
 		if err := c.get(url, &resp); err != nil {
 			return nil, fmt.Errorf("page %d: %w", page, err)
 		}
+		if !resp.Result {
+			return nil, fmt.Errorf("page %d: raindrop API returned result:false", page)
+		}
 		if len(resp.Items) == 0 {
 			break
 		}
+
 		done := false
 		for _, item := range resp.Items {
 			if !since.IsZero() && item.Created.Before(since) {
@@ -98,14 +109,20 @@ func (c *Client) GetNote(id int64) (string, error) {
 	return resp.Item.Note, nil
 }
 
-// AppendNote appends text to the existing note, respecting the 10k char limit.
+// AppendNote appends the archive URL to the existing note.
+// It is idempotent: if the archive URL is already present it returns immediately.
 func (c *Client) AppendNote(id int64, archiveURL string) error {
 	existing, err := c.GetNote(id)
 	if err != nil {
 		return fmt.Errorf("get note: %w", err)
 	}
 
-	suffix := fmt.Sprintf("\n[Archived: %s]", archiveURL)
+	// Guard against duplicate entries if MarkSynced failed on a previous run.
+	if strings.Contains(existing, archiveURL) {
+		return nil
+	}
+
+	suffix := fmt.Sprintf("\nArchived: %s", archiveURL)
 	note := existing + suffix
 	if len(note) > 10000 {
 		return fmt.Errorf("note would exceed 10,000 chars (current: %d)", len(existing))

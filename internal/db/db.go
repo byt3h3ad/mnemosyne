@@ -89,9 +89,8 @@ func (d *DB) UpsertPending(raindropID int64, originalURL string) error {
 		INSERT INTO archived_bookmarks (raindrop_id, original_url, status)
 		VALUES (?, ?, 'pending')
 		ON CONFLICT(raindrop_id) DO UPDATE SET
-			status = CASE
-				WHEN excluded.status = 'pending' AND archived_bookmarks.status = 'failed_transient'
-				THEN 'pending'
+			status = CASE archived_bookmarks.status
+				WHEN 'failed_transient' THEN 'pending'
 				ELSE archived_bookmarks.status
 			END
 	`, raindropID, originalURL)
@@ -180,9 +179,9 @@ func (d *DB) MarkSynced(raindropID int64) error {
 func (d *DB) Counts() (archived, failedPermanent, failedTransient int, err error) {
 	row := d.conn.QueryRow(`
 		SELECT
-			SUM(CASE WHEN status = 'archived' THEN 1 ELSE 0 END),
-			SUM(CASE WHEN status = 'failed_permanent' THEN 1 ELSE 0 END),
-			SUM(CASE WHEN status = 'failed_transient' THEN 1 ELSE 0 END)
+			COALESCE(SUM(CASE WHEN status = 'archived' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN status = 'failed_permanent' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN status = 'failed_transient' THEN 1 ELSE 0 END), 0)
 		FROM archived_bookmarks
 	`)
 	err = row.Scan(&archived, &failedPermanent, &failedTransient)

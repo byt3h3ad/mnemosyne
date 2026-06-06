@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/byt3h3ad/mnemosyne/internal/archiver"
 	"github.com/byt3h3ad/mnemosyne/internal/config"
@@ -19,6 +21,15 @@ func main() {
 	flag.Parse()
 
 	log.SetFlags(log.Ltime)
+
+	// Catch SIGINT/SIGTERM so deferred closes (DB flush) run on clean exit.
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-stop
+		log.Println("interrupted — shutting down")
+		os.Exit(1)
+	}()
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -36,7 +47,7 @@ func main() {
 	a := archiver.New(
 		cfg,
 		database,
-		raindrop.NewClient(cfg.RaindropToken),
+		raindrop.NewClient(cfg.RaindropToken, cfg.RateLimitMs),
 		wayback.NewClient(cfg.WaybackAccessKey, cfg.WaybackSecretKey),
 	)
 

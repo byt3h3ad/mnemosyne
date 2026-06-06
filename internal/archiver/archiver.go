@@ -13,11 +13,11 @@ import (
 )
 
 type Summary struct {
-	Fetched        int
-	Archived       int
+	Fetched         int
+	Archived        int
 	FailedPermanent int
 	FailedTransient int
-	SyncedBack     int
+	SyncedBack      int
 }
 
 func (s Summary) Print() {
@@ -42,34 +42,14 @@ func New(cfg *config.Config, database *db.DB, rd *raindrop.Client, wb *wayback.C
 // SyncBack writes archive URLs to Raindrop notes for all unsynced archived rows.
 // Returns the number of bookmarks successfully synced.
 func (a *Archiver) SyncBack() (int, error) {
-	unsynced, err := a.db.ListUnsynced()
-	if err != nil {
-		return 0, fmt.Errorf("list unsynced: %w", err)
-	}
-
-	log.Printf("%d bookmarks to sync back", len(unsynced))
-
-	synced := 0
-	for i, b := range unsynced {
-		log.Printf("  syncing back raindrop %d", b.RaindropID)
-		if err := a.raindrop.AppendNote(b.RaindropID, b.ArchiveURL); err != nil {
-			log.Printf("  sync-back failed (will retry next run): %v", err)
-		} else {
-			if err := a.db.MarkSynced(b.RaindropID); err != nil {
-				log.Printf("  db mark synced error: %v", err)
-			} else {
-				synced++
-			}
-		}
-		if i < len(unsynced)-1 {
-			time.Sleep(time.Duration(a.cfg.RateLimitMs) * time.Millisecond)
-		}
-	}
-
-	return synced, nil
+	return a.doSyncBack()
 }
 
 func (a *Archiver) Run() (Summary, error) {
+	// Record start time before any work so bookmarks created during the run
+	// are captured by the next incremental run.
+	runStart := time.Now().UTC()
+
 	// --- 1. Read run state ---
 	firstRunVal, err := a.db.GetState("first_run")
 	if err != nil {
@@ -124,6 +104,8 @@ func (a *Archiver) Run() (Summary, error) {
 
 	log.Printf("%d URLs to archive", len(pending))
 
+	var archivedCount, failedPermCount, failedTransCount int
+
 	for i, b := range pending {
 		log.Printf("[%d/%d] archiving %s", i+1, len(pending), b.OriginalURL)
 
@@ -135,6 +117,7 @@ func (a *Archiver) Run() (Summary, error) {
 				if err := a.db.MarkFailed(b.RaindropID, true, permErr.StatusExt); err != nil {
 					log.Printf("  db error: %v", err)
 				}
+				failedPermCount++
 			} else {
 				var transErr *wayback.TransientError
 				errors.As(archiveErr, &transErr)
@@ -148,28 +131,54 @@ func (a *Archiver) Run() (Summary, error) {
 				if err := a.db.MarkFailed(b.RaindropID, false, ext); err != nil {
 					log.Printf("  db error: %v", err)
 				}
+				failedTransCount++
 			}
 		} else {
 			log.Printf("  archived: %s", result.ArchiveURL)
 			if err := a.db.MarkArchived(b.RaindropID, result.ArchiveURL); err != nil {
 				log.Printf("  db error: %v", err)
 			}
+			archivedCount++
 		}
 
-		// Rate limit between submissions, not between polls.
 		if i < len(pending)-1 {
 			time.Sleep(time.Duration(a.cfg.RateLimitMs) * time.Millisecond)
 		}
 	}
 
 	// --- 4. Sync archive URLs back to Raindrop ---
+	syncedCount, err := a.doSyncBack()
+	if err != nil {
+		return Summary{}, err
+	}
+
+	// --- 5. Finalise run state ---
+	if err := a.db.SetState("last_run_at", runStart.Format(time.RFC3339)); err != nil {
+		return Summary{}, fmt.Errorf("set last_run_at: %w", err)
+	}
+	if err := a.db.SetState("first_run", "0"); err != nil {
+		return Summary{}, fmt.Errorf("set first_run: %w", err)
+	}
+
+	return Summary{
+		Fetched:         fetched,
+		Archived:        archivedCount,
+		FailedPermanent: failedPermCount,
+		FailedTransient: failedTransCount,
+		SyncedBack:      syncedCount,
+	}, nil
+}
+
+// doSyncBack is the shared implementation used by both Run and SyncBack.
+func (a *Archiver) doSyncBack() (int, error) {
 	unsynced, err := a.db.ListUnsynced()
 	if err != nil {
-		return Summary{}, fmt.Errorf("list unsynced: %w", err)
+		return 0, fmt.Errorf("list unsynced: %w", err)
 	}
 
 	log.Printf("%d bookmarks to sync back", len(unsynced))
 
+	synced := 0
 	for i, b := range unsynced {
 		log.Printf("  syncing back raindrop %d", b.RaindropID)
 		if err := a.raindrop.AppendNote(b.RaindropID, b.ArchiveURL); err != nil {
@@ -177,6 +186,8 @@ func (a *Archiver) Run() (Summary, error) {
 		} else {
 			if err := a.db.MarkSynced(b.RaindropID); err != nil {
 				log.Printf("  db mark synced error: %v", err)
+			} else {
+				synced++
 			}
 		}
 		// Raindrop allows 120 req/min; AppendNote costs 2 (GET + PUT).
@@ -185,31 +196,5 @@ func (a *Archiver) Run() (Summary, error) {
 		}
 	}
 
-	// --- 5. Finalise run state ---
-
-	now := time.Now().UTC().Format(time.RFC3339)
-	if err := a.db.SetState("last_run_at", now); err != nil {
-		return Summary{}, fmt.Errorf("set last_run_at: %w", err)
-	}
-	if err := a.db.SetState("first_run", "0"); err != nil {
-		return Summary{}, fmt.Errorf("set first_run: %w", err)
-	}
-
-	// --- 6. Build summary from DB ---
-	archived, failedPerm, failedTrans, err := a.db.Counts()
-	if err != nil {
-		return Summary{}, fmt.Errorf("counts: %w", err)
-	}
-	synced, err := a.db.CountSynced()
-	if err != nil {
-		return Summary{}, fmt.Errorf("count synced: %w", err)
-	}
-
-	return Summary{
-		Fetched:         fetched,
-		Archived:        archived,
-		FailedPermanent: failedPerm,
-		FailedTransient: failedTrans,
-		SyncedBack:      synced,
-	}, nil
+	return synced, nil
 }
