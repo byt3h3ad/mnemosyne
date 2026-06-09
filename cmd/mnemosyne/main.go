@@ -15,7 +15,15 @@ import (
 	"github.com/byt3h3ad/mnemosyne/internal/wayback"
 )
 
+// version is set at build time via -ldflags="-X 'main.version=<tag>'".
+var version = "dev"
+
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "version" {
+		fmt.Println(version)
+		return
+	}
+
 	configPath := flag.String("config", "./config.yaml", "path to config.yaml")
 	syncOnly := flag.Bool("sync-only", false, "write archive URLs to Raindrop notes without re-archiving")
 	retryFailed := flag.Bool("retry-failed", false, "also retry previously failed (transient) bookmarks")

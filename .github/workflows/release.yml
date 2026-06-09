@@ -1,0 +1,104 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Restrict default token permissions; release job overrides with write.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Use the Go version declared in go.mod to keep CI and local in sync.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Separate download from build so dependency errors are easy to spot.
+      - name: Download dependencies
+        run: go mod download
+
+      # Anchor binary timestamps to the commit, making builds reproducible.
+      - name: Set SOURCE_DATE_EPOCH
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> $GITHUB_ENV
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+          GOFLAGS: "-mod=readonly"
+          SOURCE_DATE_EPOCH: ${{ env.SOURCE_DATE_EPOCH }}
+        run: |
+          BIN=mnemo
+          [ "${{ matrix.goos }}" = "windows" ] && BIN="mnemo.exe"
+          go build \
+            -trimpath \
+            -ldflags="-s -w -X 'main.version=${{ github.ref_name }}'" \
+            -o "${BIN}" \
+            ./cmd/mnemosyne/
+
+      - name: Package (Linux / macOS)
+        if: matrix.goos != 'windows'
+        run: |
+          ARCHIVE="mnemo-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz"
+          tar czf "${ARCHIVE}" mnemo
+          echo "ARCHIVE=${ARCHIVE}" >> $GITHUB_ENV
+
+      - name: Package (Windows)
+        if: matrix.goos == 'windows'
+        run: |
+          ARCHIVE="mnemo-${{ matrix.goos }}-${{ matrix.goarch }}.zip"
+          zip "${ARCHIVE}" mnemo.exe
+          echo "ARCHIVE=${ARCHIVE}" >> $GITHUB_ENV
+
+      # Fail fast if the expected archive was never created.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: sha256sum mnemo-*.tar.gz mnemo-*.zip > checksums.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            mnemo-*.tar.gz
+            mnemo-*.zip
+            checksums.txt
+          generate_release_notes: true
+          fail_on_unmatched_files: true

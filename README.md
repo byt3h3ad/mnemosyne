@@ -76,8 +76,19 @@ rate_limit_ms: 2000        # delay between API submissions (ms)
 
 ## Build
 
-```bash
+**Windows**
+```powershell
 go build -o mnemo.exe ./cmd/mnemosyne/
+```
+
+**Linux**
+```bash
+go build -o mnemo ./cmd/mnemosyne/
+```
+
+**macOS**
+```bash
+go build -o mnemo ./cmd/mnemosyne/
 ```
 
 ## Usage
@@ -104,6 +115,44 @@ Archived:     139
 Failed:          3  (2 permanent, 1 transient)
 Synced back:  139
 ```
+
+## Releases
+
+Pre-built binaries for Windows, Linux, and macOS are published automatically to GitHub Releases whenever a version tag is pushed.
+
+### Creating a release
+
+1. Make sure all changes are committed and pushed to `main`.
+
+2. Tag the commit with a version number following [semver](https://semver.org):
+   ```bash
+   git tag v1.0.0
+   git push origin v1.0.0
+   ```
+
+3. GitHub Actions will build all five binaries and publish the release automatically. You can follow the progress under the **Actions** tab on GitHub. Once complete, the release appears under **Releases** with the following assets:
+
+   | File | Platform |
+   |---|---|
+   | `mnemo-windows-amd64.exe` | Windows (64-bit) |
+   | `mnemo-linux-amd64` | Linux (64-bit) |
+   | `mnemo-linux-arm64` | Linux (ARM64) |
+   | `mnemo-darwin-amd64` | macOS (Intel) |
+   | `mnemo-darwin-arm64` | macOS (Apple Silicon) |
+
+### Downloading a release
+
+Go to the **Releases** page on GitHub, pick the latest version, and download the binary for your platform. On Linux and macOS, mark it executable before running:
+
+```bash
+chmod +x mnemo-linux-amd64
+./mnemo-linux-amd64 --config ./config.yaml
+```
+
+### If the workflow fails
+
+- **Permission denied on release creation:** Go to `Settings → Actions → General` on your GitHub repo and make sure **Workflow permissions** is set to *Read and write permissions*.
+- **Build errors:** Check the **Actions** tab for the full log. Each platform builds independently, so a failure on one does not block the others.
 
 ## Scheduling
 
