@@ -51,6 +51,9 @@ internal/
 | `failed_transient` | Skipped | Reset to `pending` and retried |
 | `failed_permanent` | Skipped forever | Skipped forever |
 | `archived`, `synced_back=0` | Sync-back retried | Sync-back retried |
+| `archived`, `synced_back=-1` | Sync-back skipped forever¹ | Sync-back skipped forever¹ |
+
+¹ Set when the sync-back can never succeed: the bookmark was deleted in Raindrop, or its note is already at the 10,000-character limit.
 
 ## Prerequisites
 

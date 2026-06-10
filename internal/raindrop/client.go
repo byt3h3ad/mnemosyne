@@ -2,7 +2,9 @@ package raindrop
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -13,6 +15,27 @@ const (
 	baseURL = "https://api.raindrop.io/rest/v1"
 	perPage = 50
 )
+
+// PermanentSyncError signals a sync-back that can never succeed
+// (bookmark deleted in Raindrop, note already full) and should not be retried.
+type PermanentSyncError struct {
+	Reason string
+}
+
+func (e *PermanentSyncError) Error() string {
+	return "permanent sync failure: " + e.Reason
+}
+
+// httpStatusError carries the status code so callers can distinguish 404s.
+type httpStatusError struct {
+	method string
+	url    string
+	code   int
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("%s %s: status %d", e.method, e.url, e.code)
+}
 
 type Client struct {
 	token       string
@@ -49,25 +72,29 @@ type listResponse struct {
 }
 
 // FetchAll paginates through every bookmark in all collections.
-func (c *Client) FetchAll() ([]Bookmark, error) {
-	return c.paginate(time.Time{})
+func (c *Client) FetchAll(ctx context.Context) ([]Bookmark, error) {
+	return c.paginate(ctx, time.Time{})
 }
 
 // FetchSince paginates newest-first and stops when items are older than since.
-func (c *Client) FetchSince(since time.Time) ([]Bookmark, error) {
-	return c.paginate(since)
+func (c *Client) FetchSince(ctx context.Context, since time.Time) ([]Bookmark, error) {
+	return c.paginate(ctx, since)
 }
 
-func (c *Client) paginate(since time.Time) ([]Bookmark, error) {
+func (c *Client) paginate(ctx context.Context, since time.Time) ([]Bookmark, error) {
 	var all []Bookmark
 	for page := 0; ; page++ {
 		if page > 0 {
-			time.Sleep(time.Duration(c.rateLimitMs) * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(time.Duration(c.rateLimitMs) * time.Millisecond):
+			}
 		}
 
 		url := fmt.Sprintf("%s/raindrops/0?sort=-created&page=%d&perpage=%d", baseURL, page, perPage)
 		var resp listResponse
-		if err := c.get(url, &resp); err != nil {
+		if err := c.get(ctx, url, &resp); err != nil {
 			return nil, fmt.Errorf("page %d: %w", page, err)
 		}
 		if !resp.Result {
@@ -98,12 +125,12 @@ func (c *Client) paginate(since time.Time) ([]Bookmark, error) {
 }
 
 // GetNote fetches the current note for a single raindrop.
-func (c *Client) GetNote(id int64) (string, error) {
+func (c *Client) GetNote(ctx context.Context, id int64) (string, error) {
 	url := fmt.Sprintf("%s/raindrop/%d", baseURL, id)
 	var resp struct {
 		Item raindropItem `json:"item"`
 	}
-	if err := c.get(url, &resp); err != nil {
+	if err := c.get(ctx, url, &resp); err != nil {
 		return "", err
 	}
 	return resp.Item.Note, nil
@@ -111,9 +138,14 @@ func (c *Client) GetNote(id int64) (string, error) {
 
 // AppendNote appends the archive URL to the existing note.
 // It is idempotent: if the archive URL is already present it returns immediately.
-func (c *Client) AppendNote(id int64, archiveURL string) error {
-	existing, err := c.GetNote(id)
+// Returns *PermanentSyncError when the sync can never succeed.
+func (c *Client) AppendNote(ctx context.Context, id int64, archiveURL string) error {
+	existing, err := c.GetNote(ctx, id)
 	if err != nil {
+		var se *httpStatusError
+		if errors.As(err, &se) && se.code == http.StatusNotFound {
+			return &PermanentSyncError{Reason: "bookmark no longer exists in Raindrop"}
+		}
 		return fmt.Errorf("get note: %w", err)
 	}
 
@@ -125,13 +157,15 @@ func (c *Client) AppendNote(id int64, archiveURL string) error {
 	suffix := fmt.Sprintf("\nArchived: %s", archiveURL)
 	note := existing + suffix
 	if len(note) > 10000 {
-		return fmt.Errorf("note would exceed 10,000 chars (current: %d)", len(existing))
+		return &PermanentSyncError{
+			Reason: fmt.Sprintf("note would exceed 10,000 chars (current: %d)", len(existing)),
+		}
 	}
 
 	url := fmt.Sprintf("%s/raindrop/%d", baseURL, id)
 	body, _ := json.Marshal(map[string]string{"note": note})
 
-	req, err := http.NewRequest(http.MethodPut, url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -144,14 +178,17 @@ func (c *Client) AppendNote(id int64, archiveURL string) error {
 	}
 	defer httpResp.Body.Close()
 
+	if httpResp.StatusCode == http.StatusNotFound {
+		return &PermanentSyncError{Reason: "bookmark no longer exists in Raindrop"}
+	}
 	if httpResp.StatusCode != http.StatusOK {
-		return fmt.Errorf("PUT /raindrop/%d: status %d", id, httpResp.StatusCode)
+		return &httpStatusError{method: http.MethodPut, url: url, code: httpResp.StatusCode}
 	}
 	return nil
 }
 
-func (c *Client) get(url string, out any) error {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+func (c *Client) get(ctx context.Context, url string, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
 	}
@@ -165,7 +202,7 @@ func (c *Client) get(url string, out any) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
+		return &httpStatusError{method: http.MethodGet, url: url, code: resp.StatusCode}
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
 }

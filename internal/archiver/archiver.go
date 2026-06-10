@@ -1,6 +1,7 @@
 package archiver
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -41,11 +42,11 @@ func New(cfg *config.Config, database *db.DB, rd *raindrop.Client, wb *wayback.C
 
 // SyncBack writes archive URLs to Raindrop notes for all unsynced archived rows.
 // Returns the number of bookmarks successfully synced.
-func (a *Archiver) SyncBack() (int, error) {
-	return a.doSyncBack()
+func (a *Archiver) SyncBack(ctx context.Context) (int, error) {
+	return a.doSyncBack(ctx)
 }
 
-func (a *Archiver) Run(retryFailed bool) (Summary, error) {
+func (a *Archiver) Run(ctx context.Context, retryFailed bool) (Summary, error) {
 	// Record start time before any work so bookmarks created during the run
 	// are captured by the next incremental run.
 	runStart := time.Now().UTC()
@@ -80,10 +81,10 @@ func (a *Archiver) Run(retryFailed bool) (Summary, error) {
 	var bookmarks []raindrop.Bookmark
 	if isFirstRun {
 		log.Println("first run: fetching all bookmarks")
-		bookmarks, err = a.raindrop.FetchAll()
+		bookmarks, err = a.raindrop.FetchAll(ctx)
 	} else {
 		log.Printf("incremental run: fetching bookmarks since %s", lastRunAt.Format(time.RFC3339))
-		bookmarks, err = a.raindrop.FetchSince(lastRunAt)
+		bookmarks, err = a.raindrop.FetchSince(ctx, lastRunAt)
 	}
 	if err != nil {
 		return Summary{}, fmt.Errorf("fetch bookmarks: %w", err)
@@ -109,10 +110,20 @@ func (a *Archiver) Run(retryFailed bool) (Summary, error) {
 	var archivedCount, failedPermCount, failedTransCount int
 
 	for i, b := range pending {
+		if ctx.Err() != nil {
+			log.Println("interrupted — remaining bookmarks stay pending for the next run")
+			break
+		}
+
 		log.Printf("[%d/%d] archiving %s", i+1, len(pending), b.OriginalURL)
 
-		result, archiveErr := a.wayback.Archive(b.OriginalURL)
+		result, archiveErr := a.wayback.Archive(ctx, b.OriginalURL)
 		if archiveErr != nil {
+			// Don't record an interrupted attempt as a failure — leave it pending.
+			if ctx.Err() != nil {
+				log.Println("interrupted — remaining bookmarks stay pending for the next run")
+				break
+			}
 			var permErr *wayback.PermanentError
 			if errors.As(archiveErr, &permErr) {
 				log.Printf("  permanent failure: %s", permErr.StatusExt)
@@ -144,17 +155,22 @@ func (a *Archiver) Run(retryFailed bool) (Summary, error) {
 		}
 
 		if i < len(pending)-1 {
-			time.Sleep(time.Duration(a.cfg.RateLimitMs) * time.Millisecond)
+			sleepCtx(ctx, time.Duration(a.cfg.RateLimitMs)*time.Millisecond)
 		}
 	}
 
 	// --- 4. Sync archive URLs back to Raindrop ---
-	syncedCount, err := a.doSyncBack()
-	if err != nil {
-		return Summary{}, err
+	var syncedCount int
+	if ctx.Err() == nil {
+		syncedCount, err = a.doSyncBack(ctx)
+		if err != nil {
+			return Summary{}, err
+		}
 	}
 
 	// --- 5. Finalise run state ---
+	// Safe even when interrupted: everything up to runStart was fetched and
+	// upserted, and unprocessed rows stay pending for the next run.
 	if err := a.db.SetState("last_run_at", runStart.Format(time.RFC3339)); err != nil {
 		return Summary{}, fmt.Errorf("set last_run_at: %w", err)
 	}
@@ -172,7 +188,7 @@ func (a *Archiver) Run(retryFailed bool) (Summary, error) {
 }
 
 // doSyncBack is the shared implementation used by both Run and SyncBack.
-func (a *Archiver) doSyncBack() (int, error) {
+func (a *Archiver) doSyncBack(ctx context.Context) (int, error) {
 	unsynced, err := a.db.ListUnsynced()
 	if err != nil {
 		return 0, fmt.Errorf("list unsynced: %w", err)
@@ -182,9 +198,25 @@ func (a *Archiver) doSyncBack() (int, error) {
 
 	synced := 0
 	for i, b := range unsynced {
+		if ctx.Err() != nil {
+			log.Println("interrupted — remaining sync-backs will be retried next run")
+			break
+		}
+
 		log.Printf("  syncing back raindrop %d", b.RaindropID)
-		if err := a.raindrop.AppendNote(b.RaindropID, b.ArchiveURL); err != nil {
-			log.Printf("  sync-back failed (will retry next run): %v", err)
+		if err := a.raindrop.AppendNote(ctx, b.RaindropID, b.ArchiveURL); err != nil {
+			var permErr *raindrop.PermanentSyncError
+			switch {
+			case errors.As(err, &permErr):
+				log.Printf("  sync-back permanently failed (%s) — will not retry", permErr.Reason)
+				if dbErr := a.db.MarkSyncFailedPermanent(b.RaindropID, permErr.Reason); dbErr != nil {
+					log.Printf("  db error: %v", dbErr)
+				}
+			case ctx.Err() != nil:
+				log.Println("interrupted — remaining sync-backs will be retried next run")
+			default:
+				log.Printf("  sync-back failed (will retry next run): %v", err)
+			}
 		} else {
 			if err := a.db.MarkSynced(b.RaindropID); err != nil {
 				log.Printf("  db mark synced error: %v", err)
@@ -194,9 +226,17 @@ func (a *Archiver) doSyncBack() (int, error) {
 		}
 		// Raindrop allows 120 req/min; AppendNote costs 2 (GET + PUT).
 		if i < len(unsynced)-1 {
-			time.Sleep(time.Duration(a.cfg.RateLimitMs) * time.Millisecond)
+			sleepCtx(ctx, time.Duration(a.cfg.RateLimitMs)*time.Millisecond)
 		}
 	}
 
 	return synced, nil
+}
+
+// sleepCtx sleeps for d or until ctx is cancelled, whichever comes first.
+func sleepCtx(ctx context.Context, d time.Duration) {
+	select {
+	case <-ctx.Done():
+	case <-time.After(d):
+	}
 }

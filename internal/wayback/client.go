@@ -1,6 +1,7 @@
 package wayback
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -10,8 +11,8 @@ import (
 )
 
 const (
-	saveURL    = "https://web.archive.org/save"
-	pollPeriod = 5 * time.Second
+	saveURL     = "https://web.archive.org/save"
+	pollPeriod  = 5 * time.Second
 	pollTimeout = 2 * time.Minute
 )
 
@@ -67,12 +68,12 @@ func NewClient(accessKey, secretKey string) *Client {
 
 // Archive submits targetURL to the Wayback Machine and polls until done.
 // Returns Result on success, *PermanentError or *TransientError on failure.
-func (c *Client) Archive(targetURL string) (*Result, error) {
-	jobID, err := c.submit(targetURL)
+func (c *Client) Archive(ctx context.Context, targetURL string) (*Result, error) {
+	jobID, err := c.submit(ctx, targetURL)
 	if err != nil {
 		return nil, &TransientError{Message: err.Error()}
 	}
-	return c.poll(jobID, targetURL)
+	return c.poll(ctx, jobID, targetURL)
 }
 
 type submitResponse struct {
@@ -80,12 +81,12 @@ type submitResponse struct {
 	URL   string `json:"url"`
 }
 
-func (c *Client) submit(targetURL string) (string, error) {
+func (c *Client) submit(ctx context.Context, targetURL string) (string, error) {
 	body := url.Values{}
 	body.Set("url", targetURL)
 	body.Set("skip_first_archive", "1")
 
-	req, err := http.NewRequest(http.MethodPost, saveURL, strings.NewReader(body.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, saveURL, strings.NewReader(body.Encode()))
 	if err != nil {
 		return "", err
 	}
@@ -117,43 +118,42 @@ func (c *Client) submit(targetURL string) (string, error) {
 }
 
 type statusResponse struct {
-	Status    string `json:"status"`
-	JobID     string `json:"job_id"`
-	Timestamp string `json:"timestamp"`
+	Status      string `json:"status"`
+	JobID       string `json:"job_id"`
+	Timestamp   string `json:"timestamp"`
 	OriginalURL string `json:"original_url"`
-	StatusExt string `json:"status_ext"`
-	Message   string `json:"message"`
+	StatusExt   string `json:"status_ext"`
+	Message     string `json:"message"`
 }
 
-func (c *Client) poll(jobID, originalURL string) (*Result, error) {
+func (c *Client) poll(ctx context.Context, jobID, originalURL string) (*Result, error) {
 	deadline := time.Now().Add(pollTimeout)
 	pollURL := fmt.Sprintf("%s/status/%s", saveURL, jobID)
+	lastErr := ""
 
 	for time.Now().Before(deadline) {
-		time.Sleep(pollPeriod)
-
-		req, err := http.NewRequest(http.MethodGet, pollURL, nil)
-		if err != nil {
-			return nil, &TransientError{Message: err.Error()}
-		}
-		req.Header.Set("Authorization", fmt.Sprintf("LOW %s:%s", c.accessKey, c.secretKey))
-		req.Header.Set("Accept", "application/json")
-
-		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			return nil, &TransientError{Message: err.Error()}
+		select {
+		case <-ctx.Done():
+			return nil, &TransientError{Message: "interrupted while polling"}
+		case <-time.After(pollPeriod):
 		}
 
-		var sr statusResponse
-		decodeErr := json.NewDecoder(resp.Body).Decode(&sr)
-		resp.Body.Close()
-
-		if decodeErr != nil {
-			return nil, &TransientError{Message: decodeErr.Error()}
+		sr, err := c.pollOnce(ctx, pollURL)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, &TransientError{Message: "interrupted while polling"}
+			}
+			// A single failed poll doesn't mean the capture failed —
+			// keep polling until the deadline.
+			lastErr = err.Error()
+			continue
 		}
 
 		switch sr.Status {
 		case "success":
+			if sr.Timestamp == "" {
+				return nil, &TransientError{Message: "success response missing timestamp"}
+			}
 			archiveURL := fmt.Sprintf("https://web.archive.org/web/%s/%s", sr.Timestamp, originalURL)
 			return &Result{ArchiveURL: archiveURL}, nil
 
@@ -167,9 +167,39 @@ func (c *Client) poll(jobID, originalURL string) (*Result, error) {
 			return nil, &TransientError{StatusExt: sr.StatusExt, Message: sr.Message}
 
 		default:
-			return nil, &TransientError{Message: fmt.Sprintf("unexpected status %q", sr.Status)}
+			lastErr = fmt.Sprintf("unexpected status %q", sr.Status)
+			continue
 		}
 	}
 
-	return nil, &TransientError{Message: "poll timeout after 2 minutes"}
+	msg := "poll timeout after 2 minutes"
+	if lastErr != "" {
+		msg = fmt.Sprintf("%s (last poll error: %s)", msg, lastErr)
+	}
+	return nil, &TransientError{Message: msg}
+}
+
+func (c *Client) pollOnce(ctx context.Context, pollURL string) (*statusResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pollURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("LOW %s:%s", c.accessKey, c.secretKey))
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status endpoint HTTP %d", resp.StatusCode)
+	}
+
+	var sr statusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&sr); err != nil {
+		return nil, err
+	}
+	return &sr, nil
 }

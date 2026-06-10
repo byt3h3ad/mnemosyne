@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS archived_bookmarks (
     archive_url     TEXT,
     status          TEXT NOT NULL DEFAULT 'pending',
     status_ext      TEXT,
-    synced_back     INTEGER NOT NULL DEFAULT 0,
+    synced_back     INTEGER NOT NULL DEFAULT 0,  -- 0 unsynced, 1 synced, -1 permanently unsyncable
     attempted_at    TIMESTAMP,
     archived_at     TIMESTAMP,
     error           TEXT
@@ -84,11 +84,16 @@ type Bookmark struct {
 // UpsertPending inserts the bookmark as pending if not present.
 // If already archived, leaves it alone.
 // If failed_transient, resets to pending for retry.
+// For non-archived rows the URL is refreshed in case it was edited in Raindrop.
 func (d *DB) UpsertPending(raindropID int64, originalURL string) error {
 	_, err := d.conn.Exec(`
 		INSERT INTO archived_bookmarks (raindrop_id, original_url, status)
 		VALUES (?, ?, 'pending')
 		ON CONFLICT(raindrop_id) DO UPDATE SET
+			original_url = CASE
+				WHEN archived_bookmarks.status = 'archived' THEN archived_bookmarks.original_url
+				ELSE excluded.original_url
+			END,
 			status = CASE archived_bookmarks.status
 				WHEN 'failed_transient' THEN 'pending'
 				ELSE archived_bookmarks.status
@@ -172,6 +177,16 @@ func (d *DB) ListUnsynced() ([]Bookmark, error) {
 
 func (d *DB) MarkSynced(raindropID int64) error {
 	_, err := d.conn.Exec(`UPDATE archived_bookmarks SET synced_back = 1 WHERE raindrop_id = ?`, raindropID)
+	return err
+}
+
+// MarkSyncFailedPermanent excludes a bookmark from future sync-back attempts
+// (e.g. it was deleted in Raindrop, or its note is full).
+func (d *DB) MarkSyncFailedPermanent(raindropID int64, reason string) error {
+	_, err := d.conn.Exec(
+		`UPDATE archived_bookmarks SET synced_back = -1, error = ? WHERE raindrop_id = ?`,
+		reason, raindropID,
+	)
 	return err
 }
 

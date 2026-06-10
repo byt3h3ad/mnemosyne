@@ -8,11 +8,11 @@ import (
 )
 
 type Config struct {
-	RaindropToken   string `yaml:"raindrop_token"`
+	RaindropToken    string `yaml:"raindrop_token"`
 	WaybackAccessKey string `yaml:"wayback_access_key"`
 	WaybackSecretKey string `yaml:"wayback_secret_key"`
-	DBPath          string `yaml:"db_path"`
-	RateLimitMs     int    `yaml:"rate_limit_ms"`
+	DBPath           string `yaml:"db_path"`
+	RateLimitMs      int    `yaml:"rate_limit_ms"`
 }
 
 func Load(path string) (*Config, error) {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -31,14 +32,10 @@ func main() {
 
 	log.SetFlags(log.Ltime)
 
-	// Catch SIGINT/SIGTERM so deferred closes (DB flush) run on clean exit.
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-stop
-		log.Println("interrupted — shutting down")
-		os.Exit(1)
-	}()
+	// On SIGINT/SIGTERM the context is cancelled: in-flight work stops at the
+	// next checkpoint, state is finalised, and deferred closes run normally.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -61,7 +58,7 @@ func main() {
 	)
 
 	if *syncOnly {
-		n, err := a.SyncBack()
+		n, err := a.SyncBack(ctx)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "sync-back failed:", err)
 			os.Exit(1)
@@ -70,7 +67,7 @@ func main() {
 		return
 	}
 
-	summary, err := a.Run(*retryFailed)
+	summary, err := a.Run(ctx, *retryFailed)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "run failed:", err)
 		os.Exit(1)

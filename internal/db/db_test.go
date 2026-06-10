@@ -71,13 +71,50 @@ func TestDB(t *testing.T) {
 		t.Fatalf("expected row 102 back as pending, got %v", pending)
 	}
 
+	// upsert refreshes the URL for non-archived rows...
+	if err := d.UpsertPending(102, "https://example.org/edited"); err != nil {
+		t.Fatalf("UpsertPending re-upsert: %v", err)
+	}
+	pending, _ = d.ListPending()
+	if len(pending) != 1 || pending[0].OriginalURL != "https://example.org/edited" {
+		t.Fatalf("expected refreshed URL for row 102, got %v", pending)
+	}
+
+	// ...but leaves archived rows untouched
+	if err := d.UpsertPending(101, "https://example.com/edited"); err != nil {
+		t.Fatalf("UpsertPending on archived row: %v", err)
+	}
+	pending, _ = d.ListPending()
+	if len(pending) != 1 {
+		t.Fatalf("archived row 101 must not become pending again, got %v", pending)
+	}
+
+	// permanent sync failure removes the row from the unsynced list
+	if err := d.UpsertPending(103, "https://example.net"); err != nil {
+		t.Fatalf("UpsertPending 103: %v", err)
+	}
+	if err := d.MarkArchived(103, "https://web.archive.org/web/20240102/https://example.net"); err != nil {
+		t.Fatalf("MarkArchived 103: %v", err)
+	}
+	unsynced, _ = d.ListUnsynced()
+	if len(unsynced) != 1 || unsynced[0].RaindropID != 103 {
+		t.Fatalf("expected row 103 unsynced, got %v", unsynced)
+	}
+	if err := d.MarkSyncFailedPermanent(103, "bookmark no longer exists in Raindrop"); err != nil {
+		t.Fatalf("MarkSyncFailedPermanent: %v", err)
+	}
+	unsynced, _ = d.ListUnsynced()
+	if len(unsynced) != 0 {
+		t.Fatalf("expected 0 unsynced after MarkSyncFailedPermanent, got %d", len(unsynced))
+	}
+
 	// counts
 	archived, failedPerm, failedTrans, err := d.Counts()
 	if err != nil {
 		t.Fatalf("Counts: %v", err)
 	}
-	// 101 archived, 102 now pending (not failed), 0 permanent
-	if archived != 1 || failedPerm != 0 || failedTrans != 0 {
+	// 101 and 103 archived, 102 now pending (not failed), 0 permanent
+	if archived != 2 || failedPerm != 0 || failedTrans != 0 {
 		t.Fatalf("Counts: archived=%d perm=%d trans=%d", archived, failedPerm, failedTrans)
 	}
 
