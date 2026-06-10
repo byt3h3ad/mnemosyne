@@ -3,3 +3,7 @@ wayback_access_key: ""
 wayback_secret_key: ""
 db_path: "./archive.db"
 rate_limit_ms: 2000
+
+# Reuse an existing Wayback capture instead of making a new one if it is at
+# most this many days old. Saves a lot of quota on the first run. 0 disables.
+skip_archived_within_days: 90

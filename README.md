@@ -74,8 +74,15 @@ raindrop_token: "your-raindrop-test-token"
 wayback_access_key: "your-ia-access-key"
 wayback_secret_key: "your-ia-secret-key"
 db_path: "./archive.db"
-rate_limit_ms: 2000        # delay between API submissions (ms)
+rate_limit_ms: 2000             # delay between API submissions (ms)
+skip_archived_within_days: 90   # reuse existing captures this recent (0 = off)
 ```
+
+When `skip_archived_within_days` is set, each URL is first checked against the
+[Wayback Availability API](https://archive.org/help/wayback_api.php). If a
+capture newer than the limit already exists, its URL is reused instead of
+making a new capture — on a first run over an old collection this saves most
+of your capture quota.
 
 ## Build
 
@@ -100,14 +107,33 @@ go build -o mnemo ./cmd/mnemosyne/
 # Full run — archives new bookmarks only
 ./mnemo.exe
 
+# Preview what a run would do without writing anything
+./mnemo.exe --dry-run
+
 # Also retry previously failed (transient) bookmarks
 ./mnemo.exe --retry-failed
 
 # Sync archive URLs to Raindrop notes only (skips archiving)
 ./mnemo.exe --sync-only
 
+# Show DB state (no API calls)
+./mnemo.exe status
+
 # Custom config path
 ./mnemo.exe --config /path/to/config.yaml
+```
+
+### Status output
+
+```
+Pending:             0
+Archived:          139
+  synced back:     135
+  unsynced:          3
+  unsyncable:        1
+Failed permanent:    2
+Failed transient:    1
+Last run:          2026-06-08T09:00:00Z
 ```
 
 ### Example output

@@ -15,7 +15,8 @@ import (
 
 type Summary struct {
 	Fetched         int
-	Archived        int
+	Archived        int // new captures made this run
+	Reused          int // existing recent captures reused (skip_archived_within_days)
 	FailedPermanent int
 	FailedTransient int
 	SyncedBack      int
@@ -23,7 +24,11 @@ type Summary struct {
 
 func (s Summary) Print() {
 	fmt.Printf("Fetched:     %4d bookmarks\n", s.Fetched)
-	fmt.Printf("Archived:    %4d\n", s.Archived)
+	if s.Reused > 0 {
+		fmt.Printf("Archived:    %4d  (%d new, %d reused)\n", s.Archived+s.Reused, s.Archived, s.Reused)
+	} else {
+		fmt.Printf("Archived:    %4d\n", s.Archived)
+	}
 	fmt.Printf("Failed:      %4d  (%d permanent, %d transient)\n",
 		s.FailedPermanent+s.FailedTransient, s.FailedPermanent, s.FailedTransient)
 	fmt.Printf("Synced back: %4d\n", s.SyncedBack)
@@ -107,7 +112,8 @@ func (a *Archiver) Run(ctx context.Context, retryFailed bool) (Summary, error) {
 
 	log.Printf("%d URLs to archive", len(pending))
 
-	var archivedCount, failedPermCount, failedTransCount int
+	var archivedCount, reusedCount, failedPermCount, failedTransCount int
+	maxCaptureAge := time.Duration(a.cfg.SkipArchivedWithinDays) * 24 * time.Hour
 
 	for i, b := range pending {
 		if ctx.Err() != nil {
@@ -116,6 +122,20 @@ func (a *Archiver) Run(ctx context.Context, retryFailed bool) (Summary, error) {
 		}
 
 		log.Printf("[%d/%d] archiving %s", i+1, len(pending), b.OriginalURL)
+
+		if maxCaptureAge > 0 {
+			if existing, ok := a.wayback.FindRecent(ctx, b.OriginalURL, maxCaptureAge); ok {
+				log.Printf("  reusing existing capture: %s", existing)
+				if err := a.db.MarkArchived(b.RaindropID, existing); err != nil {
+					log.Printf("  db error: %v", err)
+				}
+				reusedCount++
+				if i < len(pending)-1 {
+					sleepCtx(ctx, time.Duration(a.cfg.RateLimitMs)*time.Millisecond)
+				}
+				continue
+			}
+		}
 
 		result, archiveErr := a.wayback.Archive(ctx, b.OriginalURL)
 		if archiveErr != nil {
@@ -181,10 +201,121 @@ func (a *Archiver) Run(ctx context.Context, retryFailed bool) (Summary, error) {
 	return Summary{
 		Fetched:         fetched,
 		Archived:        archivedCount,
+		Reused:          reusedCount,
 		FailedPermanent: failedPermCount,
 		FailedTransient: failedTransCount,
 		SyncedBack:      syncedCount,
 	}, nil
+}
+
+// DryRun reports what a real run would do without writing to the DB,
+// the Wayback Machine, or Raindrop. Only read-only Raindrop calls are made.
+func (a *Archiver) DryRun(ctx context.Context, retryFailed bool) error {
+	firstRunVal, err := a.db.GetState("first_run")
+	if err != nil {
+		return fmt.Errorf("read first_run: %w", err)
+	}
+	isFirstRun := firstRunVal != "0"
+
+	lastRunVal, err := a.db.GetState("last_run_at")
+	if err != nil {
+		return fmt.Errorf("read last_run_at: %w", err)
+	}
+	var lastRunAt time.Time
+	if lastRunVal != "" {
+		lastRunAt, err = time.Parse(time.RFC3339, lastRunVal)
+		if err != nil {
+			return fmt.Errorf("parse last_run_at: %w", err)
+		}
+	}
+
+	var bookmarks []raindrop.Bookmark
+	if isFirstRun {
+		log.Println("first run: fetching all bookmarks")
+		bookmarks, err = a.raindrop.FetchAll(ctx)
+	} else {
+		log.Printf("incremental run: fetching bookmarks since %s", lastRunAt.Format(time.RFC3339))
+		bookmarks, err = a.raindrop.FetchSince(ctx, lastRunAt)
+	}
+	if err != nil {
+		return fmt.Errorf("fetch bookmarks: %w", err)
+	}
+
+	// Classify what a real run would archive, deduplicated by raindrop ID.
+	type candidate struct {
+		url    string
+		reason string
+	}
+	seen := map[int64]bool{}
+	var wouldArchive []candidate
+	var alreadyArchived, skippedPermanent int
+
+	add := func(id int64, url, reason string) {
+		if !seen[id] {
+			seen[id] = true
+			wouldArchive = append(wouldArchive, candidate{url: url, reason: reason})
+		}
+	}
+
+	for _, b := range bookmarks {
+		status, err := a.db.StatusOf(b.ID)
+		if err != nil {
+			return fmt.Errorf("status of bookmark %d: %w", b.ID, err)
+		}
+		switch status {
+		case "":
+			add(b.ID, b.URL, "new")
+		case "pending":
+			add(b.ID, b.URL, "pending from previous run")
+		case "failed_transient":
+			// UpsertPending resets re-fetched transients even without --retry-failed.
+			add(b.ID, b.URL, "transient retry")
+		case "archived":
+			alreadyArchived++
+		case "failed_permanent":
+			skippedPermanent++
+		}
+	}
+
+	pending, err := a.db.ListPending()
+	if err != nil {
+		return fmt.Errorf("list pending: %w", err)
+	}
+	for _, b := range pending {
+		add(b.RaindropID, b.OriginalURL, "pending from previous run")
+	}
+
+	if retryFailed {
+		transient, err := a.db.ListTransient()
+		if err != nil {
+			return fmt.Errorf("list transient: %w", err)
+		}
+		for _, b := range transient {
+			add(b.RaindropID, b.OriginalURL, "transient retry")
+		}
+	}
+
+	unsynced, err := a.db.ListUnsynced()
+	if err != nil {
+		return fmt.Errorf("list unsynced: %w", err)
+	}
+
+	fmt.Println("\nDRY RUN — nothing was written")
+	fmt.Printf("Fetched:        %4d bookmarks\n", len(bookmarks))
+	fmt.Printf("Would archive:  %4d URLs\n", len(wouldArchive))
+	for _, c := range wouldArchive {
+		fmt.Printf("  %s  (%s)\n", c.url, c.reason)
+	}
+	fmt.Printf("Would sync back: %3d bookmarks\n", len(unsynced))
+	if alreadyArchived > 0 || skippedPermanent > 0 {
+		fmt.Printf("Skipped:        %4d  (%d already archived, %d permanently failed)\n",
+			alreadyArchived+skippedPermanent, alreadyArchived, skippedPermanent)
+	}
+	if a.cfg.SkipArchivedWithinDays > 0 {
+		fmt.Printf("Note: captures newer than %d days will be reused instead of re-archived\n",
+			a.cfg.SkipArchivedWithinDays)
+	}
+	return nil
 }
 
 // doSyncBack is the shared implementation used by both Run and SyncBack.

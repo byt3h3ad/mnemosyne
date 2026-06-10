@@ -20,7 +20,15 @@ import (
 var version = "dev"
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "version" {
+	// Optional subcommand comes before flags: mnemo [version|status] [flags]
+	args := os.Args[1:]
+	command := ""
+	if len(args) > 0 && (args[0] == "version" || args[0] == "status") {
+		command = args[0]
+		args = args[1:]
+	}
+
+	if command == "version" {
 		fmt.Println(version)
 		return
 	}
@@ -28,7 +36,13 @@ func main() {
 	configPath := flag.String("config", "./config.yaml", "path to config.yaml")
 	syncOnly := flag.Bool("sync-only", false, "write archive URLs to Raindrop notes without re-archiving")
 	retryFailed := flag.Bool("retry-failed", false, "also retry previously failed (transient) bookmarks")
-	flag.Parse()
+	dryRun := flag.Bool("dry-run", false, "report what would be archived without writing anything")
+	flag.CommandLine.Parse(args)
+
+	if *dryRun && *syncOnly {
+		fmt.Fprintln(os.Stderr, "--dry-run cannot be combined with --sync-only")
+		os.Exit(1)
+	}
 
 	log.SetFlags(log.Ltime)
 
@@ -50,12 +64,28 @@ func main() {
 	}
 	defer database.Close()
 
+	if command == "status" {
+		if err := printStatus(database); err != nil {
+			fmt.Fprintln(os.Stderr, "status:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	a := archiver.New(
 		cfg,
 		database,
 		raindrop.NewClient(cfg.RaindropToken, cfg.RateLimitMs),
 		wayback.NewClient(cfg.WaybackAccessKey, cfg.WaybackSecretKey),
 	)
+
+	if *dryRun {
+		if err := a.DryRun(ctx, *retryFailed); err != nil {
+			fmt.Fprintln(os.Stderr, "dry run failed:", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if *syncOnly {
 		n, err := a.SyncBack(ctx)
@@ -75,4 +105,36 @@ func main() {
 
 	fmt.Println()
 	summary.Print()
+}
+
+// printStatus reports DB state without making any API calls.
+func printStatus(database *db.DB) error {
+	stats, err := database.Stats()
+	if err != nil {
+		return err
+	}
+	lastRun, err := database.GetState("last_run_at")
+	if err != nil {
+		return err
+	}
+	firstRun, err := database.GetState("first_run")
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Pending:          %4d\n", stats.Pending)
+	fmt.Printf("Archived:         %4d\n", stats.Archived)
+	fmt.Printf("  synced back:    %4d\n", stats.SyncedBack)
+	fmt.Printf("  unsynced:       %4d\n", stats.Unsynced)
+	fmt.Printf("  unsyncable:     %4d\n", stats.Unsyncable)
+	fmt.Printf("Failed permanent: %4d\n", stats.FailedPermanent)
+	fmt.Printf("Failed transient: %4d\n", stats.FailedTransient)
+
+	switch {
+	case lastRun != "":
+		fmt.Printf("Last run:         %s\n", lastRun)
+	case firstRun != "0":
+		fmt.Println("Last run:         never (first run pending)")
+	}
+	return nil
 }

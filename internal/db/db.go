@@ -109,9 +109,19 @@ func (d *DB) ResetTransient() error {
 }
 
 func (d *DB) ListPending() ([]Bookmark, error) {
+	return d.listByStatus("pending")
+}
+
+// ListTransient returns rows that failed transiently and would be retried
+// with --retry-failed.
+func (d *DB) ListTransient() ([]Bookmark, error) {
+	return d.listByStatus("failed_transient")
+}
+
+func (d *DB) listByStatus(status string) ([]Bookmark, error) {
 	rows, err := d.conn.Query(`
-		SELECT raindrop_id, original_url FROM archived_bookmarks WHERE status = 'pending'
-	`)
+		SELECT raindrop_id, original_url FROM archived_bookmarks WHERE status = ?
+	`, status)
 	if err != nil {
 		return nil, err
 	}
@@ -126,6 +136,16 @@ func (d *DB) ListPending() ([]Bookmark, error) {
 		out = append(out, b)
 	}
 	return out, rows.Err()
+}
+
+// StatusOf returns the stored status for a bookmark, or "" if it is unknown.
+func (d *DB) StatusOf(raindropID int64) (string, error) {
+	var s string
+	err := d.conn.QueryRow(`SELECT status FROM archived_bookmarks WHERE raindrop_id = ?`, raindropID).Scan(&s)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return s, err
 }
 
 func (d *DB) MarkArchived(raindropID int64, archiveURL string) error {
@@ -190,21 +210,33 @@ func (d *DB) MarkSyncFailedPermanent(raindropID int64, reason string) error {
 	return err
 }
 
-// Counts returns (archived, failedPermanent, failedTransient) for the summary.
-func (d *DB) Counts() (archived, failedPermanent, failedTransient int, err error) {
-	row := d.conn.QueryRow(`
-		SELECT
-			COALESCE(SUM(CASE WHEN status = 'archived' THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN status = 'failed_permanent' THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN status = 'failed_transient' THEN 1 ELSE 0 END), 0)
-		FROM archived_bookmarks
-	`)
-	err = row.Scan(&archived, &failedPermanent, &failedTransient)
-	return
+// Stats holds aggregate counts across all bookmarks for the status command.
+type Stats struct {
+	Pending         int
+	Archived        int
+	FailedPermanent int
+	FailedTransient int
+	SyncedBack      int
+	Unsynced        int
+	Unsyncable      int
 }
 
-func (d *DB) CountSynced() (int, error) {
-	var n int
-	err := d.conn.QueryRow(`SELECT COUNT(*) FROM archived_bookmarks WHERE synced_back = 1`).Scan(&n)
-	return n, err
+func (d *DB) Stats() (Stats, error) {
+	var s Stats
+	row := d.conn.QueryRow(`
+		SELECT
+			COALESCE(SUM(status = 'pending'), 0),
+			COALESCE(SUM(status = 'archived'), 0),
+			COALESCE(SUM(status = 'failed_permanent'), 0),
+			COALESCE(SUM(status = 'failed_transient'), 0),
+			COALESCE(SUM(status = 'archived' AND synced_back = 1), 0),
+			COALESCE(SUM(status = 'archived' AND synced_back = 0), 0),
+			COALESCE(SUM(status = 'archived' AND synced_back = -1), 0)
+		FROM archived_bookmarks
+	`)
+	err := row.Scan(
+		&s.Pending, &s.Archived, &s.FailedPermanent, &s.FailedTransient,
+		&s.SyncedBack, &s.Unsynced, &s.Unsyncable,
+	)
+	return s, err
 }

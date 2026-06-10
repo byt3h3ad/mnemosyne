@@ -13,6 +13,9 @@ type Config struct {
 	WaybackSecretKey string `yaml:"wayback_secret_key"`
 	DBPath           string `yaml:"db_path"`
 	RateLimitMs      int    `yaml:"rate_limit_ms"`
+	// SkipArchivedWithinDays reuses an existing Wayback capture instead of
+	// making a new one if it is at most this many days old. 0 disables.
+	SkipArchivedWithinDays int `yaml:"skip_archived_within_days"`
 }
 
 func Load(path string) (*Config, error) {
@@ -49,6 +52,9 @@ func (c *Config) validate() error {
 	}
 	if c.RateLimitMs <= 0 {
 		c.RateLimitMs = 2000
+	}
+	if c.SkipArchivedWithinDays < 0 {
+		return errors.New("skip_archived_within_days must be >= 0")
 	}
 	return nil
 }

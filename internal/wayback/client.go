@@ -11,9 +11,10 @@ import (
 )
 
 const (
-	saveURL     = "https://web.archive.org/save"
-	pollPeriod  = 5 * time.Second
-	pollTimeout = 2 * time.Minute
+	saveURL         = "https://web.archive.org/save"
+	availabilityURL = "https://archive.org/wayback/available"
+	pollPeriod      = 5 * time.Second
+	pollTimeout     = 2 * time.Minute
 )
 
 // permanentErrors is the set of status_ext values that should never be retried.
@@ -64,6 +65,56 @@ func NewClient(accessKey, secretKey string) *Client {
 		secretKey:  secretKey,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 	}
+}
+
+type availabilityResponse struct {
+	ArchivedSnapshots struct {
+		Closest struct {
+			Available bool   `json:"available"`
+			URL       string `json:"url"`
+			Timestamp string `json:"timestamp"`
+		} `json:"closest"`
+	} `json:"archived_snapshots"`
+}
+
+// FindRecent looks up the most recent existing capture of targetURL via the
+// Wayback Availability API. It returns the capture URL and true if one exists
+// no older than maxAge. Any lookup failure returns false — the caller should
+// fall through to a normal capture.
+func (c *Client) FindRecent(ctx context.Context, targetURL string, maxAge time.Duration) (string, bool) {
+	reqURL := fmt.Sprintf("%s?url=%s", availabilityURL, url.QueryEscape(targetURL))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return "", false
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", false
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", false
+	}
+
+	var ar availabilityResponse
+	if err := json.NewDecoder(resp.Body).Decode(&ar); err != nil {
+		return "", false
+	}
+
+	closest := ar.ArchivedSnapshots.Closest
+	if !closest.Available || closest.URL == "" {
+		return "", false
+	}
+	captured, err := time.Parse("20060102150405", closest.Timestamp)
+	if err != nil || time.Since(captured) > maxAge {
+		return "", false
+	}
+
+	// The availability API returns http:// links; normalise to https.
+	return strings.Replace(closest.URL, "http://", "https://", 1), true
 }
 
 // Archive submits targetURL to the Wayback Machine and polls until done.

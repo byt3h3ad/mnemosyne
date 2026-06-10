@@ -108,19 +108,37 @@ func TestDB(t *testing.T) {
 		t.Fatalf("expected 0 unsynced after MarkSyncFailedPermanent, got %d", len(unsynced))
 	}
 
-	// counts
-	archived, failedPerm, failedTrans, err := d.Counts()
-	if err != nil {
-		t.Fatalf("Counts: %v", err)
+	// status lookup
+	status, err := d.StatusOf(101)
+	if err != nil || status != "archived" {
+		t.Fatalf("StatusOf(101): got %q, %v", status, err)
 	}
-	// 101 and 103 archived, 102 now pending (not failed), 0 permanent
-	if archived != 2 || failedPerm != 0 || failedTrans != 0 {
-		t.Fatalf("Counts: archived=%d perm=%d trans=%d", archived, failedPerm, failedTrans)
+	status, err = d.StatusOf(999)
+	if err != nil || status != "" {
+		t.Fatalf("StatusOf(999): expected empty for unknown ID, got %q, %v", status, err)
 	}
 
-	synced, _ := d.CountSynced()
-	if synced != 1 {
-		t.Fatalf("CountSynced: got %d", synced)
+	// transient listing
+	if err := d.MarkFailed(102, false, "error:cannot-fetch"); err != nil {
+		t.Fatalf("MarkFailed 102: %v", err)
+	}
+	transient, err := d.ListTransient()
+	if err != nil || len(transient) != 1 || transient[0].RaindropID != 102 {
+		t.Fatalf("ListTransient: got %v, %v", transient, err)
+	}
+
+	// stats
+	// 101 archived+synced, 102 failed_transient, 103 archived+unsyncable
+	stats, err := d.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	want := Stats{
+		Pending: 0, Archived: 2, FailedPermanent: 0, FailedTransient: 1,
+		SyncedBack: 1, Unsynced: 0, Unsyncable: 1,
+	}
+	if stats != want {
+		t.Fatalf("Stats: got %+v, want %+v", stats, want)
 	}
 
 	t.Log("all db assertions passed")
