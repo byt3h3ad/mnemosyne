@@ -99,13 +99,18 @@ func (a *Archiver) Run(ctx context.Context, retryFailed bool) (Summary, error) {
 	log.Printf("fetched %d bookmarks", fetched)
 
 	for _, b := range bookmarks {
-		if err := a.db.UpsertPending(b.ID, b.URL); err != nil {
+		if err := a.db.UpsertPending(b.ID, b.URL, b.Created); err != nil {
 			return Summary{}, fmt.Errorf("upsert bookmark %d: %w", b.ID, err)
 		}
 	}
 
 	// --- 3. Archive loop ---
-	pending, err := a.db.ListPending()
+	var pending []db.Bookmark
+	if retryFailed {
+		pending, err = a.db.ListPendingNewestFirst()
+	} else {
+		pending, err = a.db.ListPending()
+	}
 	if err != nil {
 		return Summary{}, fmt.Errorf("list pending: %w", err)
 	}
@@ -147,7 +152,7 @@ func (a *Archiver) Run(ctx context.Context, retryFailed bool) (Summary, error) {
 			var permErr *wayback.PermanentError
 			if errors.As(archiveErr, &permErr) {
 				log.Printf("  permanent failure: %s", permErr.StatusExt)
-				if err := a.db.MarkFailed(b.RaindropID, true, permErr.StatusExt); err != nil {
+				if err := a.db.MarkFailed(b.RaindropID, true, permErr.StatusExt, permErr.Error()); err != nil {
 					log.Printf("  db error: %v", err)
 				}
 				failedPermCount++
@@ -161,7 +166,7 @@ func (a *Archiver) Run(ctx context.Context, retryFailed bool) (Summary, error) {
 					msg = transErr.Message
 				}
 				log.Printf("  transient failure: %s", msg)
-				if err := a.db.MarkFailed(b.RaindropID, false, ext); err != nil {
+				if err := a.db.MarkFailed(b.RaindropID, false, ext, msg); err != nil {
 					log.Printf("  db error: %v", err)
 				}
 				failedTransCount++

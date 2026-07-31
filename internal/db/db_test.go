@@ -2,6 +2,7 @@ package db
 
 import (
 	"testing"
+	"time"
 )
 
 func TestDB(t *testing.T) {
@@ -10,6 +11,7 @@ func TestDB(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	defer d.Close()
+	createdAt := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
 
 	// run_state round-trip
 	if err := d.SetState("first_run", "1"); err != nil {
@@ -21,10 +23,10 @@ func TestDB(t *testing.T) {
 	}
 
 	// upsert two pending bookmarks
-	if err := d.UpsertPending(101, "https://example.com"); err != nil {
+	if err := d.UpsertPending(101, "https://example.com", createdAt); err != nil {
 		t.Fatalf("UpsertPending: %v", err)
 	}
-	if err := d.UpsertPending(102, "https://example.org"); err != nil {
+	if err := d.UpsertPending(102, "https://example.org", createdAt); err != nil {
 		t.Fatalf("UpsertPending: %v", err)
 	}
 
@@ -37,8 +39,15 @@ func TestDB(t *testing.T) {
 	if err := d.MarkArchived(101, "https://web.archive.org/web/20240101/https://example.com"); err != nil {
 		t.Fatalf("MarkArchived: %v", err)
 	}
-	if err := d.MarkFailed(102, false, "error:cannot-fetch"); err != nil {
+	if err := d.MarkFailed(102, false, "error:cannot-fetch", "capture could not be fetched"); err != nil {
 		t.Fatalf("MarkFailed transient: %v", err)
+	}
+	var storedError string
+	if err := d.conn.QueryRow(`SELECT error FROM archived_bookmarks WHERE raindrop_id = 102`).Scan(&storedError); err != nil {
+		t.Fatalf("read stored failure: %v", err)
+	}
+	if storedError != "capture could not be fetched" {
+		t.Fatalf("stored failure = %q, want capture could not be fetched", storedError)
 	}
 
 	// pending should now be empty
@@ -72,7 +81,7 @@ func TestDB(t *testing.T) {
 	}
 
 	// upsert refreshes the URL for non-archived rows...
-	if err := d.UpsertPending(102, "https://example.org/edited"); err != nil {
+	if err := d.UpsertPending(102, "https://example.org/edited", createdAt); err != nil {
 		t.Fatalf("UpsertPending re-upsert: %v", err)
 	}
 	pending, _ = d.ListPending()
@@ -81,7 +90,7 @@ func TestDB(t *testing.T) {
 	}
 
 	// ...but leaves archived rows untouched
-	if err := d.UpsertPending(101, "https://example.com/edited"); err != nil {
+	if err := d.UpsertPending(101, "https://example.com/edited", createdAt); err != nil {
 		t.Fatalf("UpsertPending on archived row: %v", err)
 	}
 	pending, _ = d.ListPending()
@@ -90,7 +99,7 @@ func TestDB(t *testing.T) {
 	}
 
 	// permanent sync failure removes the row from the unsynced list
-	if err := d.UpsertPending(103, "https://example.net"); err != nil {
+	if err := d.UpsertPending(103, "https://example.net", createdAt); err != nil {
 		t.Fatalf("UpsertPending 103: %v", err)
 	}
 	if err := d.MarkArchived(103, "https://web.archive.org/web/20240102/https://example.net"); err != nil {
@@ -119,7 +128,7 @@ func TestDB(t *testing.T) {
 	}
 
 	// transient listing
-	if err := d.MarkFailed(102, false, "error:cannot-fetch"); err != nil {
+	if err := d.MarkFailed(102, false, "error:cannot-fetch", "capture could not be fetched"); err != nil {
 		t.Fatalf("MarkFailed 102: %v", err)
 	}
 	transient, err := d.ListTransient()
@@ -142,4 +151,37 @@ func TestDB(t *testing.T) {
 	}
 
 	t.Log("all db assertions passed")
+}
+
+func TestListPendingNewestFirst(t *testing.T) {
+	d, err := Open(":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer d.Close()
+
+	for _, bookmark := range []struct {
+		id      int64
+		created time.Time
+	}{
+		{101, time.Date(2026, time.July, 29, 0, 0, 0, 0, time.UTC)},
+		{102, time.Date(2026, time.July, 30, 0, 0, 0, 0, time.UTC)},
+		{103, time.Date(2026, time.July, 28, 0, 0, 0, 0, time.UTC)},
+	} {
+		if err := d.UpsertPending(bookmark.id, "https://example.com", bookmark.created); err != nil {
+			t.Fatalf("insert %d: %v", bookmark.id, err)
+		}
+	}
+
+	pending, err := d.ListPendingNewestFirst()
+	if err != nil {
+		t.Fatalf("ListPendingNewestFirst: %v", err)
+	}
+	got := []int64{pending[0].RaindropID, pending[1].RaindropID, pending[2].RaindropID}
+	want := []int64{102, 101, 103}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("pending order = %v, want %v", got, want)
+		}
+	}
 }

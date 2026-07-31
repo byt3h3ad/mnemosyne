@@ -2,6 +2,7 @@ package wayback
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -23,6 +24,7 @@ var permanentErrors = map[string]bool{
 	"error:no-access":          true,
 	"error:blocked":            true,
 	"error:blocked-url":        true,
+	"error:gone":               true,
 	"error:invalid-url-syntax": true,
 }
 
@@ -60,10 +62,22 @@ type Client struct {
 }
 
 func NewClient(accessKey, secretKey string) *Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// Wayback's save endpoint currently returns HTTP 498 for Go's HTTP/2
+	// requests. Keep the client on HTTP/1.1 while retaining default transport
+	// settings such as proxy and TLS configuration.
+	transport.ForceAttemptHTTP2 = false
+	transport.TLSNextProto = nil
+	if transport.TLSClientConfig == nil {
+		transport.TLSClientConfig = &tls.Config{}
+	} else {
+		transport.TLSClientConfig = transport.TLSClientConfig.Clone()
+	}
+	transport.TLSClientConfig.NextProtos = []string{"http/1.1"}
 	return &Client{
 		accessKey:  accessKey,
 		secretKey:  secretKey,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		httpClient: &http.Client{Timeout: 30 * time.Second, Transport: transport},
 	}
 }
 
@@ -120,26 +134,58 @@ func (c *Client) FindRecent(ctx context.Context, targetURL string, maxAge time.D
 // Archive submits targetURL to the Wayback Machine and polls until done.
 // Returns Result on success, *PermanentError or *TransientError on failure.
 func (c *Client) Archive(ctx context.Context, targetURL string) (*Result, error) {
-	jobID, err := c.submit(ctx, targetURL)
+	submission, err := c.submit(ctx, targetURL)
 	if err != nil {
 		return nil, &TransientError{Message: err.Error()}
 	}
-	return c.poll(ctx, jobID, targetURL)
+	if result, err := submissionResult(submission, targetURL); result != nil || err != nil {
+		return result, err
+	}
+	if submission.JobID == "" {
+		return nil, &TransientError{Message: "wayback submit response missing job_id"}
+	}
+	return c.poll(ctx, submission.JobID, targetURL)
 }
 
 type submitResponse struct {
-	JobID string `json:"job_id"`
-	URL   string `json:"url"`
+	JobID       string `json:"job_id"`
+	URL         string `json:"url"`
+	Status      string `json:"status"`
+	Timestamp   string `json:"timestamp"`
+	OriginalURL string `json:"original_url"`
+	StatusExt   string `json:"status_ext"`
+	Message     string `json:"message"`
 }
 
-func (c *Client) submit(ctx context.Context, targetURL string) (string, error) {
+func submissionResult(submission submitResponse, targetURL string) (*Result, error) {
+	switch submission.Status {
+	case "":
+		return nil, nil
+	case "success":
+		if submission.Timestamp == "" {
+			return nil, &TransientError{Message: "successful Wayback submit response missing timestamp"}
+		}
+		return &Result{ArchiveURL: fmt.Sprintf("https://web.archive.org/web/%s/%s", submission.Timestamp, targetURL)}, nil
+	case "error":
+		if permanentErrors[submission.StatusExt] {
+			return nil, &PermanentError{StatusExt: submission.StatusExt}
+		}
+		return nil, &TransientError{StatusExt: submission.StatusExt, Message: submission.Message}
+	case "pending":
+		return nil, nil
+	default:
+		return nil, &TransientError{StatusExt: submission.StatusExt, Message: fmt.Sprintf("unexpected submit status %q: %s", submission.Status, submission.Message)}
+	}
+}
+
+func (c *Client) submit(ctx context.Context, targetURL string) (submitResponse, error) {
 	body := url.Values{}
 	body.Set("url", targetURL)
 	body.Set("skip_first_archive", "1")
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, saveURL, strings.NewReader(body.Encode()))
 	if err != nil {
-		return "", err
+		return submitResponse{}, err
 	}
 	req.Header.Set("Authorization", fmt.Sprintf("LOW %s:%s", c.accessKey, c.secretKey))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -147,25 +193,22 @@ func (c *Client) submit(ctx context.Context, targetURL string) (string, error) {
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", err
+		return submitResponse{}, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 500 {
-		return "", fmt.Errorf("wayback HTTP %d", resp.StatusCode)
+		return submitResponse{}, fmt.Errorf("wayback HTTP %d", resp.StatusCode)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("wayback submit status %d", resp.StatusCode)
+		return submitResponse{}, fmt.Errorf("wayback submit status %d", resp.StatusCode)
 	}
 
 	var sr submitResponse
 	if err := json.NewDecoder(resp.Body).Decode(&sr); err != nil {
-		return "", err
+		return submitResponse{}, err
 	}
-	if sr.JobID == "" {
-		return "", fmt.Errorf("empty job_id in response")
-	}
-	return sr.JobID, nil
+	return sr, nil
 }
 
 type statusResponse struct {

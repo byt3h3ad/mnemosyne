@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS archived_bookmarks (
     status          TEXT NOT NULL DEFAULT 'pending',
     status_ext      TEXT,
     synced_back     INTEGER NOT NULL DEFAULT 0,  -- 0 unsynced, 1 synced, -1 permanently unsyncable
+    created_at      TIMESTAMP,
     attempted_at    TIMESTAMP,
     archived_at     TIMESTAMP,
     error           TEXT
@@ -40,7 +41,36 @@ func Open(path string) (*DB, error) {
 		conn.Close()
 		return nil, err
 	}
+	if err := ensureBookmarkCreatedAt(conn); err != nil {
+		conn.Close()
+		return nil, err
+	}
 	return &DB{conn: conn}, nil
+}
+
+func ensureBookmarkCreatedAt(conn *sql.DB) error {
+	rows, err := conn.Query(`PRAGMA table_info(archived_bookmarks)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return err
+		}
+		if name == "created_at" {
+			return rows.Err()
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = conn.Exec(`ALTER TABLE archived_bookmarks ADD COLUMN created_at TIMESTAMP`)
+	return err
 }
 
 func (d *DB) Close() error {
@@ -82,23 +112,24 @@ type Bookmark struct {
 }
 
 // UpsertPending inserts the bookmark as pending if not present.
-// If already archived, leaves it alone.
-// If failed_transient, resets to pending for retry.
+// If already archived, leaves its URL alone. The Raindrop creation timestamp
+// is always refreshed so retries can be ordered newest first.
 // For non-archived rows the URL is refreshed in case it was edited in Raindrop.
-func (d *DB) UpsertPending(raindropID int64, originalURL string) error {
+func (d *DB) UpsertPending(raindropID int64, originalURL string, createdAt time.Time) error {
 	_, err := d.conn.Exec(`
-		INSERT INTO archived_bookmarks (raindrop_id, original_url, status)
-		VALUES (?, ?, 'pending')
+		INSERT INTO archived_bookmarks (raindrop_id, original_url, created_at, status)
+		VALUES (?, ?, ?, 'pending')
 		ON CONFLICT(raindrop_id) DO UPDATE SET
 			original_url = CASE
 				WHEN archived_bookmarks.status = 'archived' THEN archived_bookmarks.original_url
 				ELSE excluded.original_url
 			END,
+			created_at = excluded.created_at,
 			status = CASE archived_bookmarks.status
 				WHEN 'failed_transient' THEN 'pending'
 				ELSE archived_bookmarks.status
 			END
-	`, raindropID, originalURL)
+	`, raindropID, originalURL, createdAt)
 	return err
 }
 
@@ -110,6 +141,31 @@ func (d *DB) ResetTransient() error {
 
 func (d *DB) ListPending() ([]Bookmark, error) {
 	return d.listByStatus("pending")
+}
+
+// ListPendingNewestFirst returns pending bookmarks by Raindrop creation time.
+// Legacy entries without a stored timestamp fall back to descending bookmark ID.
+func (d *DB) ListPendingNewestFirst() ([]Bookmark, error) {
+	rows, err := d.conn.Query(`
+		SELECT raindrop_id, original_url
+		FROM archived_bookmarks
+		WHERE status = 'pending'
+		ORDER BY created_at IS NULL, created_at DESC, raindrop_id DESC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Bookmark
+	for rows.Next() {
+		var b Bookmark
+		if err := rows.Scan(&b.RaindropID, &b.OriginalURL); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
 }
 
 // ListTransient returns rows that failed transiently and would be retried
@@ -158,7 +214,7 @@ func (d *DB) MarkArchived(raindropID int64, archiveURL string) error {
 	return err
 }
 
-func (d *DB) MarkFailed(raindropID int64, permanent bool, statusExt string) error {
+func (d *DB) MarkFailed(raindropID int64, permanent bool, statusExt, message string) error {
 	status := "failed_transient"
 	if permanent {
 		status = "failed_permanent"
@@ -168,7 +224,7 @@ func (d *DB) MarkFailed(raindropID int64, permanent bool, statusExt string) erro
 		UPDATE archived_bookmarks
 		SET status = ?, status_ext = ?, error = ?, attempted_at = ?
 		WHERE raindrop_id = ?
-	`, status, statusExt, statusExt, now, raindropID)
+	`, status, statusExt, message, now, raindropID)
 	return err
 }
 
