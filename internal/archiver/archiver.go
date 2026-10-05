@@ -45,10 +45,34 @@ func New(cfg *config.Config, database *db.DB, rd *raindrop.Client, wb *wayback.C
 	return &Archiver{cfg: cfg, db: database, raindrop: rd, wayback: wb}
 }
 
-// SyncBack writes archive URLs to Raindrop notes for all unsynced archived rows.
-// Returns the number of bookmarks successfully synced.
-func (a *Archiver) SyncBack(ctx context.Context) (int, error) {
-	return a.doSyncBack(ctx)
+// fetchBookmarks pulls every bookmark on the first run, or only those created
+// since last_run_at afterwards.
+func (a *Archiver) fetchBookmarks(ctx context.Context) ([]raindrop.Bookmark, error) {
+	firstRunVal, err := a.db.GetState("first_run")
+	if err != nil {
+		return nil, fmt.Errorf("read first_run: %w", err)
+	}
+	var since time.Time
+	if firstRunVal != "0" {
+		log.Println("first run: fetching all bookmarks")
+	} else {
+		lastRunVal, err := a.db.GetState("last_run_at")
+		if err != nil {
+			return nil, fmt.Errorf("read last_run_at: %w", err)
+		}
+		if lastRunVal != "" {
+			since, err = time.Parse(time.RFC3339, lastRunVal)
+			if err != nil {
+				return nil, fmt.Errorf("parse last_run_at: %w", err)
+			}
+		}
+		log.Printf("incremental run: fetching bookmarks since %s", since.Format(time.RFC3339))
+	}
+	bookmarks, err := a.raindrop.Fetch(ctx, since)
+	if err != nil {
+		return nil, fmt.Errorf("fetch bookmarks: %w", err)
+	}
+	return bookmarks, nil
 }
 
 func (a *Archiver) Run(ctx context.Context, retryFailed bool) (Summary, error) {
@@ -57,25 +81,6 @@ func (a *Archiver) Run(ctx context.Context, retryFailed bool) (Summary, error) {
 	runStart := time.Now().UTC()
 
 	// --- 1. Read run state ---
-	firstRunVal, err := a.db.GetState("first_run")
-	if err != nil {
-		return Summary{}, fmt.Errorf("read first_run: %w", err)
-	}
-	isFirstRun := firstRunVal != "0"
-
-	lastRunVal, err := a.db.GetState("last_run_at")
-	if err != nil {
-		return Summary{}, fmt.Errorf("read last_run_at: %w", err)
-	}
-	var lastRunAt time.Time
-	if lastRunVal != "" {
-		lastRunAt, err = time.Parse(time.RFC3339, lastRunVal)
-		if err != nil {
-			return Summary{}, fmt.Errorf("parse last_run_at: %w", err)
-		}
-	}
-
-	// Only reset transient failures when explicitly requested.
 	if retryFailed {
 		if err := a.db.ResetTransient(); err != nil {
 			return Summary{}, fmt.Errorf("reset transient: %w", err)
@@ -83,16 +88,9 @@ func (a *Archiver) Run(ctx context.Context, retryFailed bool) (Summary, error) {
 	}
 
 	// --- 2. Fetch bookmarks ---
-	var bookmarks []raindrop.Bookmark
-	if isFirstRun {
-		log.Println("first run: fetching all bookmarks")
-		bookmarks, err = a.raindrop.FetchAll(ctx)
-	} else {
-		log.Printf("incremental run: fetching bookmarks since %s", lastRunAt.Format(time.RFC3339))
-		bookmarks, err = a.raindrop.FetchSince(ctx, lastRunAt)
-	}
+	bookmarks, err := a.fetchBookmarks(ctx)
 	if err != nil {
-		return Summary{}, fmt.Errorf("fetch bookmarks: %w", err)
+		return Summary{}, err
 	}
 
 	fetched := len(bookmarks)
@@ -117,8 +115,9 @@ func (a *Archiver) Run(ctx context.Context, retryFailed bool) (Summary, error) {
 
 	log.Printf("%d URLs to archive", len(pending))
 
-	var archivedCount, reusedCount, failedPermCount, failedTransCount int
+	var s Summary
 	maxCaptureAge := time.Duration(a.cfg.SkipArchivedWithinDays) * 24 * time.Hour
+	delay := time.Duration(a.cfg.RateLimitMs) * time.Millisecond
 
 	for i, b := range pending {
 		if ctx.Err() != nil {
@@ -128,66 +127,62 @@ func (a *Archiver) Run(ctx context.Context, retryFailed bool) (Summary, error) {
 
 		log.Printf("[%d/%d] archiving %s", i+1, len(pending), b.OriginalURL)
 
+		var existing string
+		var reused bool
 		if maxCaptureAge > 0 {
-			if existing, ok := a.wayback.FindRecent(ctx, b.OriginalURL, maxCaptureAge); ok {
-				log.Printf("  reusing existing capture: %s", existing)
-				if err := a.db.MarkArchived(b.RaindropID, existing); err != nil {
-					log.Printf("  db error: %v", err)
-				}
-				reusedCount++
-				if i < len(pending)-1 {
-					sleepCtx(ctx, time.Duration(a.cfg.RateLimitMs)*time.Millisecond)
-				}
-				continue
-			}
+			existing, reused = a.wayback.FindRecent(ctx, b.OriginalURL, maxCaptureAge)
 		}
 
-		result, archiveErr := a.wayback.Archive(ctx, b.OriginalURL)
-		if archiveErr != nil {
-			// Don't record an interrupted attempt as a failure — leave it pending.
-			if ctx.Err() != nil {
-				log.Println("interrupted — remaining bookmarks stay pending for the next run")
-				break
-			}
-			var permErr *wayback.PermanentError
-			if errors.As(archiveErr, &permErr) {
-				log.Printf("  permanent failure: %s", permErr.StatusExt)
-				if err := a.db.MarkFailed(b.RaindropID, true, permErr.StatusExt, permErr.Error()); err != nil {
-					log.Printf("  db error: %v", err)
-				}
-				failedPermCount++
-			} else {
-				var transErr *wayback.TransientError
-				errors.As(archiveErr, &transErr)
-				msg := archiveErr.Error()
-				ext := ""
-				if transErr != nil {
-					ext = transErr.StatusExt
-					msg = transErr.Message
-				}
-				log.Printf("  transient failure: %s", msg)
-				if err := a.db.MarkFailed(b.RaindropID, false, ext, msg); err != nil {
-					log.Printf("  db error: %v", err)
-				}
-				failedTransCount++
-			}
-		} else {
-			log.Printf("  archived: %s", result.ArchiveURL)
-			if err := a.db.MarkArchived(b.RaindropID, result.ArchiveURL); err != nil {
+		if reused {
+			log.Printf("  reusing existing capture: %s", existing)
+			if err := a.db.MarkArchived(b.RaindropID, existing); err != nil {
 				log.Printf("  db error: %v", err)
 			}
-			archivedCount++
+			s.Reused++
+		} else {
+			result, archiveErr := a.wayback.Archive(ctx, b.OriginalURL)
+			if archiveErr == nil {
+				log.Printf("  archived: %s", result.ArchiveURL)
+				if err := a.db.MarkArchived(b.RaindropID, result.ArchiveURL); err != nil {
+					log.Printf("  db error: %v", err)
+				}
+				s.Archived++
+			} else if ctx.Err() != nil {
+				// Don't record an interrupted attempt as a failure — leave it pending.
+				log.Println("interrupted — remaining bookmarks stay pending for the next run")
+				break
+			} else {
+				var permErr *wayback.PermanentError
+				var transErr *wayback.TransientError
+				permanent, ext, msg := false, "", archiveErr.Error()
+				switch {
+				case errors.As(archiveErr, &permErr):
+					permanent, ext = true, permErr.StatusExt
+				case errors.As(archiveErr, &transErr):
+					ext, msg = transErr.StatusExt, transErr.Message
+				}
+				if permanent {
+					log.Printf("  permanent failure: %s", ext)
+					s.FailedPermanent++
+				} else {
+					log.Printf("  transient failure: %s", msg)
+					s.FailedTransient++
+				}
+				if err := a.db.MarkFailed(b.RaindropID, permanent, ext, msg); err != nil {
+					log.Printf("  db error: %v", err)
+				}
+			}
 		}
 
 		if i < len(pending)-1 {
-			sleepCtx(ctx, time.Duration(a.cfg.RateLimitMs)*time.Millisecond)
+			sleepCtx(ctx, delay)
 		}
 	}
 
 	// --- 4. Sync archive URLs back to Raindrop ---
 	var syncedCount int
 	if ctx.Err() == nil {
-		syncedCount, err = a.doSyncBack(ctx)
+		syncedCount, err = a.SyncBack(ctx)
 		if err != nil {
 			return Summary{}, err
 		}
@@ -203,47 +198,17 @@ func (a *Archiver) Run(ctx context.Context, retryFailed bool) (Summary, error) {
 		return Summary{}, fmt.Errorf("set first_run: %w", err)
 	}
 
-	return Summary{
-		Fetched:         fetched,
-		Archived:        archivedCount,
-		Reused:          reusedCount,
-		FailedPermanent: failedPermCount,
-		FailedTransient: failedTransCount,
-		SyncedBack:      syncedCount,
-	}, nil
+	s.Fetched = fetched
+	s.SyncedBack = syncedCount
+	return s, nil
 }
 
 // DryRun reports what a real run would do without writing to the DB,
 // the Wayback Machine, or Raindrop. Only read-only Raindrop calls are made.
 func (a *Archiver) DryRun(ctx context.Context, retryFailed bool) error {
-	firstRunVal, err := a.db.GetState("first_run")
+	bookmarks, err := a.fetchBookmarks(ctx)
 	if err != nil {
-		return fmt.Errorf("read first_run: %w", err)
-	}
-	isFirstRun := firstRunVal != "0"
-
-	lastRunVal, err := a.db.GetState("last_run_at")
-	if err != nil {
-		return fmt.Errorf("read last_run_at: %w", err)
-	}
-	var lastRunAt time.Time
-	if lastRunVal != "" {
-		lastRunAt, err = time.Parse(time.RFC3339, lastRunVal)
-		if err != nil {
-			return fmt.Errorf("parse last_run_at: %w", err)
-		}
-	}
-
-	var bookmarks []raindrop.Bookmark
-	if isFirstRun {
-		log.Println("first run: fetching all bookmarks")
-		bookmarks, err = a.raindrop.FetchAll(ctx)
-	} else {
-		log.Printf("incremental run: fetching bookmarks since %s", lastRunAt.Format(time.RFC3339))
-		bookmarks, err = a.raindrop.FetchSince(ctx, lastRunAt)
-	}
-	if err != nil {
-		return fmt.Errorf("fetch bookmarks: %w", err)
+		return err
 	}
 
 	// Classify what a real run would archive, deduplicated by raindrop ID.
@@ -323,8 +288,9 @@ func (a *Archiver) DryRun(ctx context.Context, retryFailed bool) error {
 	return nil
 }
 
-// doSyncBack is the shared implementation used by both Run and SyncBack.
-func (a *Archiver) doSyncBack(ctx context.Context) (int, error) {
+// SyncBack writes archive URLs to Raindrop notes for all unsynced archived rows.
+// Returns the number of bookmarks successfully synced.
+func (a *Archiver) SyncBack(ctx context.Context) (int, error) {
 	unsynced, err := a.db.ListUnsynced()
 	if err != nil {
 		return 0, fmt.Errorf("list unsynced: %w", err)

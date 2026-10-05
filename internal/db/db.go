@@ -146,26 +146,12 @@ func (d *DB) ListPending() ([]Bookmark, error) {
 // ListPendingNewestFirst returns pending bookmarks by Raindrop creation time.
 // Legacy entries without a stored timestamp fall back to descending bookmark ID.
 func (d *DB) ListPendingNewestFirst() ([]Bookmark, error) {
-	rows, err := d.conn.Query(`
-		SELECT raindrop_id, original_url
+	return d.list(`
+		SELECT raindrop_id, original_url, ''
 		FROM archived_bookmarks
 		WHERE status = 'pending'
 		ORDER BY created_at IS NULL, created_at DESC, raindrop_id DESC
 	`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var out []Bookmark
-	for rows.Next() {
-		var b Bookmark
-		if err := rows.Scan(&b.RaindropID, &b.OriginalURL); err != nil {
-			return nil, err
-		}
-		out = append(out, b)
-	}
-	return out, rows.Err()
 }
 
 // ListTransient returns rows that failed transiently and would be retried
@@ -175,9 +161,12 @@ func (d *DB) ListTransient() ([]Bookmark, error) {
 }
 
 func (d *DB) listByStatus(status string) ([]Bookmark, error) {
-	rows, err := d.conn.Query(`
-		SELECT raindrop_id, original_url FROM archived_bookmarks WHERE status = ?
-	`, status)
+	return d.list(`SELECT raindrop_id, original_url, '' FROM archived_bookmarks WHERE status = ?`, status)
+}
+
+// list runs a query returning (raindrop_id, original_url, archive_url).
+func (d *DB) list(query string, args ...any) ([]Bookmark, error) {
+	rows, err := d.conn.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -186,7 +175,7 @@ func (d *DB) listByStatus(status string) ([]Bookmark, error) {
 	var out []Bookmark
 	for rows.Next() {
 		var b Bookmark
-		if err := rows.Scan(&b.RaindropID, &b.OriginalURL); err != nil {
+		if err := rows.Scan(&b.RaindropID, &b.OriginalURL, &b.ArchiveURL); err != nil {
 			return nil, err
 		}
 		out = append(out, b)
@@ -230,25 +219,11 @@ func (d *DB) MarkFailed(raindropID int64, permanent bool, statusExt, message str
 
 // ListUnsynced returns archived rows that haven't been written back to Raindrop yet.
 func (d *DB) ListUnsynced() ([]Bookmark, error) {
-	rows, err := d.conn.Query(`
-		SELECT raindrop_id, original_url, archive_url
+	return d.list(`
+		SELECT raindrop_id, original_url, COALESCE(archive_url, '')
 		FROM archived_bookmarks
 		WHERE status = 'archived' AND synced_back = 0
 	`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var out []Bookmark
-	for rows.Next() {
-		var b Bookmark
-		if err := rows.Scan(&b.RaindropID, &b.OriginalURL, &b.ArchiveURL); err != nil {
-			return nil, err
-		}
-		out = append(out, b)
-	}
-	return out, rows.Err()
 }
 
 func (d *DB) MarkSynced(raindropID int64) error {

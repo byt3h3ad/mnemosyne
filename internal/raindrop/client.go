@@ -55,7 +55,6 @@ func NewClient(token string, rateLimitMs int) *Client {
 type Bookmark struct {
 	ID      int64
 	URL     string
-	Note    string
 	Created time.Time
 }
 
@@ -71,17 +70,9 @@ type listResponse struct {
 	Items  []raindropItem `json:"items"`
 }
 
-// FetchAll paginates through every bookmark in all collections.
-func (c *Client) FetchAll(ctx context.Context) ([]Bookmark, error) {
-	return c.paginate(ctx, time.Time{})
-}
-
-// FetchSince paginates newest-first and stops when items are older than since.
-func (c *Client) FetchSince(ctx context.Context, since time.Time) ([]Bookmark, error) {
-	return c.paginate(ctx, since)
-}
-
-func (c *Client) paginate(ctx context.Context, since time.Time) ([]Bookmark, error) {
+// Fetch paginates bookmarks across all collections, newest first. If since is
+// non-zero it stops at the first item older than since; zero fetches everything.
+func (c *Client) Fetch(ctx context.Context, since time.Time) ([]Bookmark, error) {
 	var all []Bookmark
 	for page := 0; ; page++ {
 		if page > 0 {
@@ -113,7 +104,6 @@ func (c *Client) paginate(ctx context.Context, since time.Time) ([]Bookmark, err
 			all = append(all, Bookmark{
 				ID:      item.ID,
 				URL:     item.Link,
-				Note:    item.Note,
 				Created: item.Created,
 			})
 		}
